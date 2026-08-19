@@ -143,7 +143,9 @@ static short SatAdd( short a, short b )
 	return( (short)v );
 }
 
-static void CaptureFrames( const void *buf, int frames, int mono, u32 who )
+#define VOL_MAX	0x8000						/* PSP_AUDIO_VOLUME_MAX				*/
+
+static void CaptureFrames( const void *buf, int frames, int mono, u32 who, int lvol, int rvol )
 {
 	u32 pos, oldmax, newmax;
 	int srcbytes, i;
@@ -152,6 +154,10 @@ static void CaptureFrames( const void *buf, int frames, int mono, u32 who )
 	if ( (buf == NULL) || (frames <= 0) ){ return; }
 	if ( who > CAPTURE_SRC ){ return; }
 	if ( frames > AUDIO_FRAMES_MAX ){ return; }
+
+	if ( lvol < 0 ){ lvol = 0; }  if ( lvol > VOL_MAX ){ lvol = VOL_MAX; }
+	if ( rvol < 0 ){ rvol = 0; }  if ( rvol > VOL_MAX ){ rvol = VOL_MAX; }
+	if ( (lvol == 0) && (rvol == 0) ){ return; }	/* silent channel			*/
 
 	srcbytes = mono ? (frames*2) : (frames*4);
 	if ( UserBufOk( buf, srcbytes ) == 0 ){ Stats.bad_ptr++; return; }
@@ -186,12 +192,20 @@ static void CaptureFrames( const void *buf, int frames, int mono, u32 who )
 	{
 		const short *src = (const short *)buf;
 		for ( i=0; i<frames; i++ ){
-			u32   idx = ((pos + (u32)i) & AUDIO_RING_MASK) * 2;
-			short l, r;
+			u32 idx = ((pos + (u32)i) & AUDIO_RING_MASK) * 2;
+			int l, r, sl, sr;
 			if ( mono ){ l = src[i];      r = l;            }
 			else	   { l = src[i*2+0];  r = src[i*2+1];   }
-			AudioRing[idx+0] = SatAdd( AudioRing[idx+0], l );
-			AudioRing[idx+1] = SatAdd( AudioRing[idx+1], r );
+			/* apply the volume the game requested, as the hardware does */
+			l = (l * lvol) >> 15;
+			r = (r * rvol) >> 15;
+			sl = (int)AudioRing[idx+0] + l;
+			sr = (int)AudioRing[idx+1] + r;
+			if ( (sl > 32767) || (sl < -32768) || (sr > 32767) || (sr < -32768) ){
+				Stats.clip++;
+			}
+			AudioRing[idx+0] = SatAdd( AudioRing[idx+0], (short)l );
+			AudioRing[idx+1] = SatAdd( AudioRing[idx+1], (short)r );
 		}
 	}
 }
@@ -237,7 +251,7 @@ static int MyOutputBlocking( int ch, int vol, void *buf )
 	int ret = Orig_OutputBlocking( ch, vol, buf );
 	Stats.cnt_output++;
 	if ( (ret >= 0) && ((u32)ch < 8) ){
-		CaptureFrames( buf, PickFrames( ChanSamples[ch], ret ), ChanMono[ch], ch );
+		CaptureFrames( buf, PickFrames( ChanSamples[ch], ret ), ChanMono[ch], ch, vol, vol );
 	}
 	return( ret );
 }
@@ -247,7 +261,7 @@ static int MyOutputPannedBlocking( int ch, int lvol, int rvol, void *buf )
 	int ret = Orig_OutputPannedBlocking( ch, lvol, rvol, buf );
 	Stats.cnt_panned++;
 	if ( (ret >= 0) && ((u32)ch < 8) ){
-		CaptureFrames( buf, PickFrames( ChanSamples[ch], ret ), ChanMono[ch], ch );
+		CaptureFrames( buf, PickFrames( ChanSamples[ch], ret ), ChanMono[ch], ch, lvol, rvol );
 	}
 	return( ret );
 }
@@ -268,7 +282,7 @@ static int MySRCOutputBlocking( int vol, void *buf )
 {
 	int ret = Orig_SRCOutputBlocking( vol, buf );
 	Stats.cnt_src++;
-	if ( ret >= 0 ){ CaptureFrames( buf, PickFrames( SrcSamples, ret ), SrcMono, CAPTURE_SRC ); }
+	if ( ret >= 0 ){ CaptureFrames( buf, PickFrames( SrcSamples, ret ), SrcMono, CAPTURE_SRC, vol, vol ); }
 	return( ret );
 }
 
@@ -296,7 +310,7 @@ static int MyOutput2OutputBlocking( int vol, void *buf )
 {
 	int ret = Orig_Output2OutputBlocking( vol, buf );
 	Stats.cnt_src++;
-	if ( ret >= 0 ){ CaptureFrames( buf, PickFrames( SrcSamples, ret ), SrcMono, CAPTURE_SRC ); }
+	if ( ret >= 0 ){ CaptureFrames( buf, PickFrames( SrcSamples, ret ), SrcMono, CAPTURE_SRC, vol, vol ); }
 	return( ret );
 }
 

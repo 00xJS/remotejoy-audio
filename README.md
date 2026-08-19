@@ -83,6 +83,13 @@ code-signed pages, and the next launch is killed with `Code Signature Invalid`.
 
 Start a game on the PSP, connect USB, then run `scripts/stream.sh`.
 
+### Before you return to the XMB
+
+**Unplug the USB cable before quitting a game back to the home screen.** With the cable still
+attached the PSP can hang on the way out and need a battery pull. Leaving a game while the plugin is
+actively streaming asks the console to tear down its audio, display and USB drivers while a kernel
+plugin is still feeding all three. Unplug first, exit, then reconnect for the next game.
+
 ---
 
 ## Building the plugin
@@ -131,6 +138,7 @@ The core logs a counter line every couple of seconds:
 - Audio from the XMB itself is not captured — the menu uses a different path than games.
 - Only 44.1kHz sources are correct today; other rates are not resampled yet.
 - Input forwarding (playing from the computer) is still unimplemented in the libretro client.
+- Exiting to the XMB with the USB cable connected can hang the console (see above) - unplug first.
 - Kernel-mode code: a bug can hang the PSP. A battery pull recovers it, and custom firmware is not
   at risk. Hold **R** while powering on to reach recovery and disable plugins.
 

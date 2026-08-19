@@ -27,10 +27,10 @@ index f9566e9..e29d84a 100644
  
  bool retro_load_game(const struct retro_game_info *info)
 diff --git a/libretro/remotejoy.c b/libretro/remotejoy.c
-index 430c05f..ffd9042 100644
+index 430c05f..7246341 100644
 --- a/libretro/remotejoy.c
 +++ b/libretro/remotejoy.c
-@@ -1,14 +1,111 @@
+@@ -1,14 +1,112 @@
  #include <stdint.h>
  #include <string.h>
  #include <signal.h>
@@ -62,6 +62,7 @@ index 430c05f..ffd9042 100644
 +   uint32_t ring_level;
 +   uint32_t bad_ptr;
 +   uint32_t cnt_disp;
++   uint32_t clip;
 +   uint32_t n_slots;
 +   uint32_t dbg_cop0;
 +   uint32_t dbg_func;
@@ -142,7 +143,7 @@ index 430c05f..ffd9042 100644
  #define HOSTFS_MAGIC 0x782f0812
  #define ASYNC_MAGIC  0x782f0813
  #define BULK_MAGIC   0x782f0814
-@@ -184,6 +281,14 @@ static bool handle_hello(libusb_device_handle *dev)
+@@ -184,6 +282,14 @@ static bool handle_hello(libusb_device_handle *dev)
        return false;
     }
  
@@ -157,7 +158,7 @@ index 430c05f..ffd9042 100644
     return true;
  }
  
-@@ -276,6 +381,42 @@ static void process_bulk(const uint8_t *block, size_t size)
+@@ -276,6 +382,42 @@ static void process_bulk(const uint8_t *block, size_t size)
     //printf("VCount: %d\n", le32(header->ref));
     //printf("Size: %d\n", le32(header->size));
  
@@ -183,11 +184,11 @@ index 430c05f..ffd9042 100644
 +      g_audio_stats_seen++;
 +      if (log_cb && claimed >= sizeof(*st))
 +         log_cb(RETRO_LOG_INFO,
-+               "[audio] hooks=0x%03x chres=%u srcres=%u out=%u panned=%u src=%u drop=%u chans=0x%02x rate=%u ring=%u badptr=%u disp=%u slots=%u\n",
++               "[audio] hooks=0x%03x chres=%u srcres=%u out=%u panned=%u src=%u drop=%u chans=0x%02x rate=%u ring=%u badptr=%u disp=%u clip=%u slots=%u\n",
 +               le32(st->hooks_ok), le32(st->cnt_chreserve), le32(st->cnt_srcreserve),
 +               le32(st->cnt_output), le32(st->cnt_panned), le32(st->cnt_src),
 +               le32(st->drop_bytes), le32(st->capture_chan), le32(st->src_rate),
-+               le32(st->ring_level), le32(st->bad_ptr), le32(st->cnt_disp), le32(st->n_slots));
++               le32(st->ring_level), le32(st->bad_ptr), le32(st->cnt_disp), le32(st->clip), le32(st->n_slots));
 +      if (log_cb && claimed >= sizeof(*st))
 +         log_cb(RETRO_LOG_INFO,
 +               "[audio] TABLE cop0=0x%08x func=0x%08x | A: size=%d hits=%d | B: size=%d hits=%d\n",
@@ -200,7 +201,7 @@ index 430c05f..ffd9042 100644
     slock_lock(g_lock);
  
     //memcpy(g_frame, block + sizeof(*header), le32(header->size));
-@@ -283,19 +424,19 @@ static void process_bulk(const uint8_t *block, size_t size)
+@@ -283,19 +425,19 @@ static void process_bulk(const uint8_t *block, size_t size)
     switch ((header->mode >> 4) & 0x0f)
     {
        case 0x00:
@@ -224,7 +225,7 @@ index 430c05f..ffd9042 100644
           break;
        default:
           if (log_cb)
-@@ -318,6 +459,17 @@ static bool handle_bulk(libusb_device_handle *dev, uint8_t *data, size_t size)
+@@ -318,6 +460,17 @@ static bool handle_bulk(libusb_device_handle *dev, uint8_t *data, size_t size)
     size_t data_size = le32(cmd->size);
     //printf("Data size: %zu\n", data_size);
  
@@ -242,7 +243,7 @@ index 430c05f..ffd9042 100644
     while (read_size < data_size)
     {
        size_t to_read = data_size - read_size;
-@@ -331,6 +483,9 @@ static bool handle_bulk(libusb_device_handle *dev, uint8_t *data, size_t size)
+@@ -331,6 +484,9 @@ static bool handle_bulk(libusb_device_handle *dev, uint8_t *data, size_t size)
        if (ret < 0)
           return false;
  
@@ -252,7 +253,7 @@ index 430c05f..ffd9042 100644
        read_size += transferred;
     }
  
-@@ -367,13 +522,72 @@ error:
+@@ -367,13 +523,72 @@ error:
     return -1;
  }
  
@@ -328,7 +329,7 @@ index 430c05f..ffd9042 100644
  
     bool active = false;
  
-@@ -383,7 +597,7 @@ static void bulk_thread(void *dummy)
+@@ -383,7 +598,7 @@ static void bulk_thread(void *dummy)
        if (active)
        {
           if (!send_event(TYPE_JOY_DAT, 0, 0))
@@ -337,7 +338,7 @@ index 430c05f..ffd9042 100644
        }
  
        int transferred = 0;
-@@ -415,7 +629,8 @@ static void bulk_thread(void *dummy)
+@@ -415,7 +630,8 @@ static void bulk_thread(void *dummy)
              if (!handle_hello(g_dev))
                 goto error;
  
@@ -347,7 +348,7 @@ index 430c05f..ffd9042 100644
              break;
           case ASYNC_MAGIC:
              //printf("ASYNC_MAGIC\n");
-@@ -435,65 +650,81 @@ static void bulk_thread(void *dummy)
+@@ -435,65 +651,81 @@ static void bulk_thread(void *dummy)
  
     return;
  error:
@@ -466,7 +467,7 @@ index 430c05f..ffd9042 100644
     g_thread_failed = false;
     g_thread_die    = false;
     g_thread = sthread_create(bulk_thread, NULL);
-@@ -523,14 +754,14 @@ void deinit_program(void)
+@@ -523,14 +755,14 @@ void deinit_program(void)
        g_lock = NULL;
     }
  
@@ -486,7 +487,7 @@ index 430c05f..ffd9042 100644
     if (g_ctx)
     {
        libusb_exit(g_ctx);
-@@ -543,6 +774,24 @@ void run_program(void)
+@@ -543,6 +775,24 @@ void run_program(void)
     if (g_thread_failed)
        environ_cb(RETRO_ENVIRONMENT_SHUTDOWN, NULL);
  

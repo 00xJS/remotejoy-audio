@@ -242,10 +242,10 @@ index 72da0b9..02d17ef 100644
  	int ret = sceDisplaySetFrameBuf_Func( topaddr, bufferwidth, pixelformat, sync );
  	return( ret );
 diff --git a/remotejoy.h b/remotejoy.h
-index 97f2547..386a611 100644
+index 97f2547..ba5433b 100644
 --- a/remotejoy.h
 +++ b/remotejoy.h
-@@ -14,9 +14,38 @@
+@@ -14,9 +14,39 @@
  
  #define TYPE_JOY_CMD			1
  #define TYPE_JOY_DAT			2
@@ -272,6 +272,7 @@ index 97f2547..386a611 100644
 +	unsigned int ring_level;
 +	unsigned int bad_ptr;		/* rejected user pointers */
 +	unsigned int cnt_disp;		/* control: sceDisplay syscall hook entries */
++	unsigned int clip;			/* saturated samples during mixing */
 +	unsigned int n_slots;		/* syscall slots patched (first-match, safe path) */
 +	unsigned int dbg_cop0;		/* raw cfc0 $12 */
 +	unsigned int dbg_func;		/* sceAudioOutputPannedBlocking address */
