@@ -1,0 +1,286 @@
+diff --git a/RemoteJoyLite_psp/Makefile b/RemoteJoyLite_psp/Makefile
+index 91d0175..e2133cf 100644
+--- a/RemoteJoyLite_psp/Makefile
++++ b/RemoteJoyLite_psp/Makefile
+@@ -1,6 +1,6 @@
+ TARGET  = RemoteJoyLite
+-OBJS    = RemoteJoyLite.o usb.o kmode.o exports.o debug.o hook.o hook_test.o hook_impose.o hook_ctrl.o hook_display.o hook_usb.o hook_interrupt.o
+-LIBS    = -lpspctrl_driver -lpspusb_driver -lpspusbbus_driver -lpsppower_driver -lpspdisplay_driver
++OBJS    = RemoteJoyLite.o usb.o kmode.o exports.o debug.o hook.o hook_test.o hook_impose.o hook_ctrl.o hook_display.o hook_usb.o hook_interrupt.o hook_audio.o
++LIBS    = -lpspctrl_driver -lpspusb_driver -lpspusbbus_driver -lpsppower_driver -lpspdisplay_driver -lpspsysmem_kernel_660 -lpsploadcore_kernel_660
+ CFLAGS  = -O2 -G0 -Wall -fno-builtin-printf -DRELEASE
+ #CFLAGS  = -O2 -G0 -Wall -fno-builtin-printf
+ ASFLAGS = $(CFLAGS)
+diff --git a/RemoteJoyLite_psp/RemoteJoyLite.c b/RemoteJoyLite_psp/RemoteJoyLite.c
+index eed1606..cb5dbbf 100644
+--- a/RemoteJoyLite_psp/RemoteJoyLite.c
++++ b/RemoteJoyLite_psp/RemoteJoyLite.c
+@@ -15,6 +15,8 @@
+ #include "../remotejoy.h"
+ #include "usb.h"
+ #include "hook.h"
++#include "hook_audio.h"
++#include "hook_interrupt.h"
+ #include "kmode.h"
+ #include "debug.h"
+ 
+@@ -73,6 +75,7 @@ static int TranceMode  = 0;
+ static int TranceFPS   = 0;
+ static int DebugMode   = 0;
+ static int ScreenReady = 0;
++static volatile int Quitting = 0;
+ static int LineFlag = 0;
+ static void *ScreenBuff = NULL;
+ static int ScreenX = 0;
+@@ -94,6 +97,7 @@ void SendDispEvent( void )
+ {
+ 	unsigned int k1;
+ 
++	if ( Quitting ){ return; }
+ 	if ( ScreenReady == 0 ){ return; }
+ 	int NowVcount = sceDisplayGetVcount();
+ 	int SubVcount = NowVcount - PreVcount;
+@@ -113,12 +117,14 @@ void SendDispEvent( void )
+ static void BuildFrame( void )
+ {
+ 	void *src;
++
++	if ( Quitting ){ return; }
+ 	int pitch, orgfmt, sync, size = 0;
+ 	struct JoyScrHeader *joy = ScreenBuff;
+ 
+-	sceDisplayGetFrameBufferInternal( 0, &src, &pitch, &orgfmt, (int)&sync );
++	sceDisplayGetFrameBufferInternal( 0, &src, &pitch, &orgfmt, &sync );
+ 	if ( src == NULL ){
+-		sceDisplayGetFrameBufferInternal( 2, &src, &pitch, &orgfmt, (int)&sync );
++		sceDisplayGetFrameBufferInternal( 2, &src, &pitch, &orgfmt, &sync );
+ 	}
+ 	if ( src == NULL ){ return; }
+ 	if ( joy == NULL ){ return; }
+@@ -187,6 +193,7 @@ static int ScreenThread( SceSize args, void *argp )
+ 	if ( ScreenSemaphore < 0 ){ sceKernelExitDeleteThread( 0 ); }
+ 
+ 	hookDisplay();
++	hookAudio();
+ 
+ 	BuildFrame();
+ 
+@@ -206,6 +213,7 @@ static int ScreenThread( SceSize args, void *argp )
+ 			HcountMkFrameTop = sceDisplayGetAccumulatedHcount();
+ #endif
+ 			BuildFrame();
++			AudioDrain();
+ #ifndef RELEASE
+ 			HcountMkFrameSub = sceDisplayGetAccumulatedHcount() - HcountMkFrameTop;
+ #endif
+@@ -331,11 +339,62 @@ static int MainThread( SceSize args, void *argp )
+ 		if ( joyevent.type == TYPE_JOY_CMD ){
+ 			DoJoyCmd( joyevent.value1, joyevent.value2 );
+ 		}
++		if ( joyevent.type == TYPE_AUDIO_CMD ){
++			AudioSetActive( joyevent.value1 );
++		}
+ 		scePowerTick( 0 );
+ 	}
+ 	return( 0 );
+ }
+ 
++/*------------------------------------------------------------------------------*/
++/* Shutdown																		*/
++/*																				*/
++/* Exiting a game to the XMB does NOT call module_stop - the firmware reboots	*/
++/* the kernel instead (loadexec runReboot). Without the reboot notifications		*/
++/* below, this plugin keeps a VBlank sub-interrupt handler, patched syscall		*/
++/* slots and two kernel threads live while sceAudio/sceDisplay/USB tear			*/
++/* themselves down underneath it - which is what froze the PSP.					*/
++/*------------------------------------------------------------------------------*/
++static void RjlQuiesce( void )
++{
++	Quitting    = 1;
++	ScreenReady = 0;
++	AudioSetActive( 0 );		/* audio wrappers stop capturing				*/
++	TranceAsyncOff();			/* release the VBlank sub-interrupt vector		*/
++}
++
++static void RjlTeardown( void )
++{
++	static int done = 0;
++	if ( done ){ return; }
++	done = 1;
++
++	RjlQuiesce();
++	unhookAudio();				/* put the sceAudio syscall slots back			*/
++}
++
++/*------------------------------------------------------------------------------*/
++/* module_reboot_phase : runs before user threads are suspended					*/
++/*------------------------------------------------------------------------------*/
++int module_reboot_phase( int arg1, void *arg2, int arg3, int arg4 )
++{
++	(void)arg1; (void)arg2; (void)arg3; (void)arg4;
++	RjlQuiesce();
++	return( 0 );
++}
++
++/*------------------------------------------------------------------------------*/
++/* module_reboot_before : runs after user threads are suspended, before			*/
++/* reboot.bin is loaded - the correct place to restore what we patched.			*/
++/*------------------------------------------------------------------------------*/
++int module_reboot_before( void *argp, int arg1, int arg2, int arg3 )
++{
++	(void)argp; (void)arg1; (void)arg2; (void)arg3;
++	RjlTeardown();
++	return( 0 );
++}
++
+ /*------------------------------------------------------------------------------*/
+ /* module_start																	*/
+ /*------------------------------------------------------------------------------*/
+@@ -364,6 +423,8 @@ int module_start( SceSize args, void *argp )
+ /*------------------------------------------------------------------------------*/
+ int module_stop( SceSize args, void *argp )
+ {
++	RjlTeardown();
++
+ 	if ( ScreenThreadID  >= 0 ){ sceKernelDeleteThread( ScreenThreadID ); }
+ 	if ( ScreenEventFlag >= 0 ){ sceKernelDeleteEventFlag( ScreenEventFlag ); }
+ 	if ( ScreenSemaphore >= 0 ){ sceKernelDeleteSema( ScreenSemaphore ); }
+diff --git a/RemoteJoyLite_psp/exports.exp b/RemoteJoyLite_psp/exports.exp
+index 6162436..4289930 100644
+--- a/RemoteJoyLite_psp/exports.exp
++++ b/RemoteJoyLite_psp/exports.exp
+@@ -2,6 +2,8 @@ PSP_BEGIN_EXPORTS
+ PSP_EXPORT_START(syslib, 0, 0x8000)
+ PSP_EXPORT_FUNC(module_start)
+ PSP_EXPORT_FUNC(module_stop)
++PSP_EXPORT_FUNC(module_reboot_before)
++PSP_EXPORT_FUNC(module_reboot_phase)
+ PSP_EXPORT_VAR(module_info)
+ PSP_EXPORT_END
+ PSP_END_EXPORTS
+diff --git a/RemoteJoyLite_psp/hook.c b/RemoteJoyLite_psp/hook.c
+index 4bfb033..44287f6 100644
+--- a/RemoteJoyLite_psp/hook.c
++++ b/RemoteJoyLite_psp/hook.c
+@@ -51,6 +51,46 @@ void *HookSyscallAddress( void *addr )
+ 	return( NULL );
+ }
+ 
++/*------------------------------------------------------------------------------*/
++/* SyscallPtrOk : only ever dereference something that looks like RAM			*/
++/*------------------------------------------------------------------------------*/
++int SyscallPtrOk( const void *p )
++{
++	u32 a = (u32)p;
++	if ( a == 0 ){ return( 0 ); }
++	if ( a & 3 ){ return( 0 ); }
++	a &= 0x1FFFFFFF;
++	if ( (a >= 0x08000000) && (a < 0x0C000000) ){ return( 1 ); }	/* kernel+user RAM	*/
++	if ( (a >= 0x04000000) && (a < 0x04200000) ){ return( 1 ); }	/* VRAM				*/
++	return( 0 );
++}
++
++/*------------------------------------------------------------------------------*/
++/* SyscallCountMatches : READ-ONLY. Counts slots holding `addr` (top bit		*/
++/* ignored) in the table at `base`, and reports the table's declared size.		*/
++/* Writes nothing - v7 wrote to every match and crashed the PSP, so we measure	*/
++/* the real layout before touching it again.									*/
++/*------------------------------------------------------------------------------*/
++int SyscallCountMatches( void *base, void *addr, int *out_size )
++{
++	u32 *tbl = (u32 *)base;
++	int i, size, hits = 0;
++
++	if ( out_size != NULL ){ *out_size = -1; }
++	if ( !SyscallPtrOk( tbl ) ){ return( -1 ); }
++
++	size = (int)((tbl[3] - 0x10) / sizeof(u32));
++	if ( out_size != NULL ){ *out_size = size; }
++	if ( (size <= 0) || (size > 0x8000) ){ return( -2 ); }
++	if ( !SyscallPtrOk( &tbl[4+size-1] ) ){ return( -3 ); }
++
++	u32 want = (u32)addr & 0x7FFFFFFF;
++	for ( i=0; i<size; i++ ){
++		if ( (tbl[4+i] & 0x7FFFFFFF) == want ){ hits++; }
++	}
++	return( hits );
++}
++
+ /*------------------------------------------------------------------------------*/
+ /* HookFuncSetting																*/
+ /*------------------------------------------------------------------------------*/
+diff --git a/RemoteJoyLite_psp/hook.h b/RemoteJoyLite_psp/hook.h
+index 8de1220..cefed90 100644
+--- a/RemoteJoyLite_psp/hook.h
++++ b/RemoteJoyLite_psp/hook.h
+@@ -16,5 +16,7 @@
+ extern void *HookNidAddress( SceModule *mod, char *libname, u32 nid );
+ extern void *HookSyscallAddress( void *addr );
+ extern void HookFuncSetting( void *addr, void *entry );
++extern int  SyscallPtrOk( const void *p );
++extern int  SyscallCountMatches( void *base, void *addr, int *out_size );
+ 
+ #endif	// _HOOK_H_
+diff --git a/RemoteJoyLite_psp/hook_display.c b/RemoteJoyLite_psp/hook_display.c
+index 72da0b9..02d17ef 100644
+--- a/RemoteJoyLite_psp/hook_display.c
++++ b/RemoteJoyLite_psp/hook_display.c
+@@ -4,6 +4,7 @@
+ #include <pspkernel.h>
+ #include "debug.h"
+ #include "hook.h"
++#include "hook_audio.h"
+ 
+ /*------------------------------------------------------------------------------*/
+ /* prototype																	*/
+@@ -24,6 +25,7 @@ static int (*sceDisplayWaitVblankStartCB_Func)( void ) = NULL;
+ /*------------------------------------------------------------------------------*/
+ static int MyDisplaySetFrameBuf( void *topaddr, int bufferwidth, int pixelformat, int sync )
+ {
++	AudioNoteDisplayHook();
+ 	SendDispEvent();
+ 	int ret = sceDisplaySetFrameBuf_Func( topaddr, bufferwidth, pixelformat, sync );
+ 	return( ret );
+diff --git a/remotejoy.h b/remotejoy.h
+index 97f2547..386a611 100644
+--- a/remotejoy.h
++++ b/remotejoy.h
+@@ -14,9 +14,38 @@
+ 
+ #define TYPE_JOY_CMD			1
+ #define TYPE_JOY_DAT			2
++#define TYPE_AUDIO_CMD			3
+ 
+ #define ASYNC_CMD_DEBUG			1
+ 
++/* audio-over-usb extension: distinct JoyScrHeader.mode values (video frames	*/
++/* only ever carry 0-3 in bits 4-7, so 0xA/0xB there are safely ours)			*/
++#define AUDIO_MODE_PCM			0xA0
++#define AUDIO_MODE_STAT			0xB0
++
++struct AudioStats
++{
++	unsigned int hooks_ok;		/* bitmask of the 10 installed hooks; 0x3FF = all */
++	unsigned int cnt_chreserve;
++	unsigned int cnt_srcreserve;
++	unsigned int cnt_output;
++	unsigned int cnt_panned;
++	unsigned int cnt_src;
++	unsigned int drop_bytes;
++	unsigned int capture_chan;	/* 0-7 hw chan, 8=SRC, 0xFF=none yet */
++	unsigned int src_rate;
++	unsigned int ring_level;
++	unsigned int bad_ptr;		/* rejected user pointers */
++	unsigned int cnt_disp;		/* control: sceDisplay syscall hook entries */
++	unsigned int n_slots;		/* syscall slots patched (first-match, safe path) */
++	unsigned int dbg_cop0;		/* raw cfc0 $12 */
++	unsigned int dbg_func;		/* sceAudioOutputPannedBlocking address */
++	int          dbg_a_size;	/* table size if cop0 IS the table */
++	int          dbg_a_hits;	/* matching slots under that reading */
++	int          dbg_b_size;	/* table size if cop0 must be dereferenced once */
++	int          dbg_b_hits;	/* matching slots under that reading */
++} __attribute__((packed));
++
+ #define RJL_VERSION				190
+ #define HOSTFS_CMD_HELLO(ver)	((0x8FFC<<16)|ver)
+ 

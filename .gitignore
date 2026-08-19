@@ -1,0 +1,12 @@
+# build artifacts
+*.o
+*.elf
+*.dylib
+*.so
+*.a
+
+# local working notes: README.md is the only doc that ships
+/*.md
+!README.md
+
+.DS_Store
