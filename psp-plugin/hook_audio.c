@@ -35,8 +35,8 @@
 #define AUDIO_FRAMES_MAX	4096			/* sanity cap per hooked call		*/
 /* Channels submit at slightly different times, so hold a short window before	*/
 /* draining to let every channel contribute to the same stretch of timeline.	*/
-#define MIX_LAG_FRAMES		1024			/* ~23ms								*/
-#define AUDIO_CHUNKS_PER_RUN 2				/* bound: never starve video		*/
+#define MIX_LAG_FRAMES		1024			/* ~23ms; must exceed a channel buffer period */
+#define AUDIO_CHUNKS_PER_RUN 4				/* headroom when video runs slow	*/
 #define AUDIO_COPY_MAX		(8*1024)		/* sanity cap per hooked call		*/
 #define AUDIO_STAT_PERIOD	128				/* drain calls between stat packets	*/
 #define CAPTURE_NONE		0xFF
@@ -69,7 +69,8 @@
 static short AudioRing[AUDIO_RING_FRAMES*2];
 static u32   MixMax   = 0;				/* highest absolute frame written		*/
 static u32   MixDrain = 0;				/* next absolute frame to send			*/
-static u32   ChanPos[CAPTURE_SRC+1];	/* per-channel write cursor (0-7 hw, 8=SRC) */
+static u32   MixT0    = 0;				/* system-time-low at timeline frame 0	*/
+static int   MixHave0 = 0;
 
 static volatile int AudioActive = 0;
 static int HooksInstalled = 0;
@@ -132,9 +133,142 @@ static int UserBufOk( const void *buf, int bytes )
 }
 
 /*------------------------------------------------------------------------------*/
+/* Channel-format recovery														*/
+/*																				*/
+/* The client connects after the game has reserved its audio channels, so we	*/
+/* never see sceAudioChReserve and cannot know which channels are mono. Reading	*/
+/* a mono channel as stereo garbles it (cutscene voice). We recover the real		*/
+/* format from the driver's own g_audio.chans[] table, located WITHOUT any		*/
+/* hardcoded address: we scan the resolved sceAudio originals for the global		*/
+/* pointers they build, then PROVE a candidate is the real table by checking		*/
+/* that chans[ch].leftVol/rightVol equal the volumes we just passed. Every read	*/
+/* is range-checked; on any doubt we leave the channel assumed-stereo (no		*/
+/* regression, no freeze).														*/
+/*------------------------------------------------------------------------------*/
+#define GA_CHANS_OFF		1232	/* offsetof(SceAudio, chans) - uofw			*/
+#define GA_STRIDE			16		/* sizeof(SceAudioChannel)					*/
+#define GA_OFF_BPS			11		/* u8: 2=mono 4=stereo						*/
+#define GA_OFF_LVOL			12		/* u16										*/
+#define GA_OFF_RVOL			14		/* u16										*/
+#define GA_MAX_CAND			32
+
+static u32 GaCand[GA_MAX_CAND];
+static int GaCandN   = 0;
+static u32 GaChans   = 0;			/* proven &g_audio.chans[0], or 0			*/
+static int GaState   = 0;			/* 0 untried, 1 locked, -1 gave up			*/
+static int GaTries   = 0;
+static u8  FmtKnown[8];		/* per-channel format cached (cleared ~1/sec)	*/
+
+/* Decode the lui/addiu/ori constant-building in a resolved original and collect	*/
+/* every kernel-RAM pointer it forms. Reads only that function's own text.		*/
+static void ScanFuncForGlobals( void *func )
+{
+	u32 reg[32];
+	u8  based[32];
+	int i;
+
+	if ( func == NULL ){ return; }
+	for ( i=0; i<32; i++ ){ reg[i] = 0; based[i] = 0; }
+
+	for ( i=0; i<96 && GaCandN<GA_MAX_CAND; i++ ){
+		u32 w, op, rs, rt, imm;
+		if ( SafeKernelRead32( (u32)func + (u32)i*4, &w ) == 0 ){ break; }
+		op  = w >> 26;
+		rs  = (w >> 21) & 0x1F;
+		rt  = (w >> 16) & 0x1F;
+		imm = w & 0xFFFF;
+
+		if ( (op == 0x00) && ((w & 0x3F) == 0x08) ){ break; }	/* jr $ra		*/
+
+		if ( op == 0x0F ){						/* lui rt, imm					*/
+			reg[rt] = imm << 16; based[rt] = 1;
+		} else if ( op == 0x09 ){				/* addiu rt, rs, imm (signed)	*/
+			if ( based[rs] ){ reg[rt] = reg[rs] + (u32)(int)(short)imm; based[rt] = 1; }
+			else			{ based[rt] = 0; }
+		} else if ( op == 0x0D ){				/* ori rt, rs, imm				*/
+			if ( based[rs] ){ reg[rt] = reg[rs] | imm; based[rt] = 1; }
+			else			{ based[rt] = 0; }
+		} else if ( op == 0x00 ){				/* R-type: result not a global	*/
+			u32 rd = (w >> 11) & 0x1F;
+			if ( rd != 0 ){ based[rd] = 0; }
+		}
+
+		/* record a fully-formed base that could hold the 8-channel table */
+		if ( based[rt] && KernelDataOk( reg[rt], GA_STRIDE*8, 4 ) ){
+			int j, dup = 0;
+			for ( j=0; j<GaCandN; j++ ){ if ( GaCand[j] == reg[rt] ){ dup = 1; break; } }
+			if ( (dup == 0) && (GaCandN < GA_MAX_CAND) ){ GaCand[GaCandN++] = reg[rt]; }
+		}
+	}
+}
+
+static void AudioResolveInit( void )
+{
+	GaCandN = 0;
+	ScanFuncForGlobals( (void *)Orig_OutputPannedBlocking );
+	ScanFuncForGlobals( (void *)Orig_OutputBlocking );
+	ScanFuncForGlobals( (void *)Orig_ChReserve );
+}
+
+/* Prove a candidate base against the (channel, lvol, rvol) we just observed.	*/
+static void AudioTryLock( u32 ch, int lvol, int rvol )
+{
+	int c;
+	if ( GaState != 0 ){ return; }
+	if ( ch >= 8 ){ return; }
+	if ( (lvol == 0) && (rvol == 0) ){ return; }	/* weak key: skip			*/
+	if ( ++GaTries > 4000 ){ GaState = -1; return; }
+
+	for ( c=0; c<GaCandN; c++ ){
+		u32 bases[2];
+		int b;
+		bases[0] = GaCand[c];					/* candidate = &chans[0]		*/
+		bases[1] = GaCand[c] + GA_CHANS_OFF;	/* candidate = &g_audio			*/
+		for ( b=0; b<2; b++ ){
+			u32 e = bases[b] + ch*GA_STRIDE;
+			u16 lv, rv;
+			u8  bps;
+			if ( KernelDataOk( bases[b], GA_STRIDE*8, 4 ) == 0 ){ continue; }
+			if ( SafeKernelRead16( e + GA_OFF_LVOL, &lv ) == 0 ){ continue; }
+			if ( SafeKernelRead16( e + GA_OFF_RVOL, &rv ) == 0 ){ continue; }
+			if ( (lv != (u16)lvol) || (rv != (u16)rvol) ){ continue; }
+			if ( SafeKernelRead8( e + GA_OFF_BPS, &bps ) == 0 ){ continue; }
+			if ( (bps != 2) && (bps != 4) ){ continue; }
+			GaChans = bases[b];					/* 32-bit vol match => real		*/
+			GaState = 1;
+			Stats.mono_mask |= 0x80000000u;		/* locked						*/
+			return;
+		}
+	}
+}
+
+/* Authoritative mono test once locked; falls back to the assumed value.		*/
+static int AudioChanMono( u32 ch, int assumed )
+{
+	u8 bps;
+	if ( (GaState != 1) || (ch >= 8) ){ return( assumed ); }
+	if ( FmtKnown[ch] ){ return( ChanMono[ch] ); }		/* cached: no kernel read	*/
+	if ( SafeKernelRead8( GaChans + ch*GA_STRIDE + GA_OFF_BPS, &bps ) == 0 ){ return( assumed ); }
+	if ( bps == 2 ){ ChanMono[ch] = 1; FmtKnown[ch] = 1; Stats.mono_mask |= (1u << ch);  return( 1 ); }
+	if ( bps == 4 ){ ChanMono[ch] = 0; FmtKnown[ch] = 1; Stats.mono_mask &= ~(1u << ch); return( 0 ); }
+	return( assumed );
+}
+
+/*------------------------------------------------------------------------------*/
 /* CaptureFrames : who = hw channel 0-7 or CAPTURE_SRC							*/
 /* Called AFTER the original sceAudio call returned success.					*/
 /*------------------------------------------------------------------------------*/
+/* Position every channel on ONE timeline by real playback time, so channels	*/
+/* that started at different moments stay aligned instead of drifting.			*/
+static u32 NowFrame( void )
+{
+	u32 now = sceKernelGetSystemTimeLow();
+	u32 dus;
+	if ( MixHave0 == 0 ){ MixT0 = now; MixHave0 = 1; }
+	dus = now - MixT0;						/* microseconds since frame 0			*/
+	return( (u32)(((unsigned long long)dus * 441) / 10000) );	/* * 44100/1e6	*/
+}
+
 static short SatAdd( short a, short b )
 {
 	int v = (int)a + (int)b;
@@ -143,7 +277,7 @@ static short SatAdd( short a, short b )
 	return( (short)v );
 }
 
-#define VOL_MAX	0x8000						/* PSP_AUDIO_VOLUME_MAX				*/
+#define VOL_MAX	0xFFFF						/* hardware max; 0x8000 == unity	*/
 
 static void CaptureFrames( const void *buf, int frames, int mono, u32 who, int lvol, int rvol )
 {
@@ -162,22 +296,20 @@ static void CaptureFrames( const void *buf, int frames, int mono, u32 who, int l
 	srcbytes = mono ? (frames*2) : (frames*4);
 	if ( UserBufOk( buf, srcbytes ) == 0 ){ Stats.bad_ptr++; return; }
 
-	/* -- reserve a span on the shared timeline ------------------------------ */
+	/* -- place this span at its real playback time on the shared timeline ---- */
 	int intc = pspSdkDisableInterrupts();
-	pos = ChanPos[who];
-	/* a new or previously idle channel joins at the leading edge */
-	if ( ((int)(pos - MixDrain) < 0) || ((int)(pos - MixMax) > 0) ){ pos = MixMax; }
+	pos = NowFrame();
+	if ( (int)(pos - MixDrain) < 0 ){ pos = MixDrain; }	/* too late: drop the gap, don't shift */
 	oldmax = MixMax;
 	newmax = pos + (u32)frames;
 	if ( (int)(newmax - oldmax) > 0 ){
 		u32 p;
-		for ( p=oldmax; p!=newmax; p++ ){		/* silence before summing		*/
+		for ( p=oldmax; p!=newmax; p++ ){		/* silence any gap ahead of the mix	*/
 			AudioRing[(p & AUDIO_RING_MASK)*2+0] = 0;
 			AudioRing[(p & AUDIO_RING_MASK)*2+1] = 0;
 		}
 		MixMax = newmax;
 	}
-	ChanPos[who]        = newmax;
 	Stats.capture_chan |= (1u << who);			/* bitmask of channels seen		*/
 	if ( (int)(MixMax - MixDrain) > (AUDIO_RING_FRAMES - 64) ){
 		u32 skip = (u32)((int)(MixMax - MixDrain) - (AUDIO_RING_FRAMES - 64));
@@ -193,17 +325,14 @@ static void CaptureFrames( const void *buf, int frames, int mono, u32 who, int l
 		const short *src = (const short *)buf;
 		for ( i=0; i<frames; i++ ){
 			u32 idx = ((pos + (u32)i) & AUDIO_RING_MASK) * 2;
-			int l, r, sl, sr;
+			int l, r;
 			if ( mono ){ l = src[i];      r = l;            }
 			else	   { l = src[i*2+0];  r = src[i*2+1];   }
 			/* apply the volume the game requested, as the hardware does */
 			l = (l * lvol) >> 15;
 			r = (r * rvol) >> 15;
-			sl = (int)AudioRing[idx+0] + l;
-			sr = (int)AudioRing[idx+1] + r;
-			if ( (sl > 32767) || (sl < -32768) || (sr > 32767) || (sr < -32768) ){
-				Stats.clip++;
-			}
+			if ( l >  32767 ){ l =  32767; }  if ( l < -32768 ){ l = -32768; }
+			if ( r >  32767 ){ r =  32767; }  if ( r < -32768 ){ r = -32768; }
 			AudioRing[idx+0] = SatAdd( AudioRing[idx+0], (short)l );
 			AudioRing[idx+1] = SatAdd( AudioRing[idx+1], (short)r );
 		}
@@ -251,7 +380,8 @@ static int MyOutputBlocking( int ch, int vol, void *buf )
 	int ret = Orig_OutputBlocking( ch, vol, buf );
 	Stats.cnt_output++;
 	if ( (ret >= 0) && ((u32)ch < 8) ){
-		CaptureFrames( buf, PickFrames( ChanSamples[ch], ret ), ChanMono[ch], ch, vol, vol );
+		AudioTryLock( ch, vol, vol );
+		CaptureFrames( buf, PickFrames( ChanSamples[ch], ret ), AudioChanMono( ch, ChanMono[ch] ), ch, vol, vol );
 	}
 	return( ret );
 }
@@ -261,7 +391,8 @@ static int MyOutputPannedBlocking( int ch, int lvol, int rvol, void *buf )
 	int ret = Orig_OutputPannedBlocking( ch, lvol, rvol, buf );
 	Stats.cnt_panned++;
 	if ( (ret >= 0) && ((u32)ch < 8) ){
-		CaptureFrames( buf, PickFrames( ChanSamples[ch], ret ), ChanMono[ch], ch, lvol, rvol );
+		AudioTryLock( ch, lvol, rvol );
+		CaptureFrames( buf, PickFrames( ChanSamples[ch], ret ), AudioChanMono( ch, ChanMono[ch] ), ch, lvol, rvol );
 	}
 	return( ret );
 }
@@ -391,6 +522,7 @@ void hookAudio( void )
 	if ( HookAudioNid( module, NID_Output2ChangeLength,	 MyOutput2ChangeLength,	  (void **)&Orig_Output2ChangeLength   ) ){ Stats.hooks_ok |= 0x100; }
 	if ( HookAudioNid( module, NID_Output2OutputBlocking, MyOutput2OutputBlocking, (void **)&Orig_Output2OutputBlocking ) ){ Stats.hooks_ok |= 0x200; }
 
+	AudioResolveInit();
 	HooksInstalled = 1;
 }
 
@@ -430,10 +562,9 @@ void AudioSetActive( int on )
 	int intc = pspSdkDisableInterrupts();
 	AudioActive = (on != 0);
 	if ( AudioActive ){
-		int c;
 		MixMax   = 0;
 		MixDrain = 0;
-		for ( c=0; c<=CAPTURE_SRC; c++ ){ ChanPos[c] = 0; }
+		MixHave0 = 0;
 		memset( AudioRing, 0, sizeof(AudioRing) );
 		AudioSeq = 0;
 	}
@@ -451,7 +582,9 @@ void AudioDrain( void )
 	if ( AudioActive == 0 ){ return; }
 
 	if ( ++StatTick >= AUDIO_STAT_PERIOD ){
+		int fc;
 		StatTick = 0;
+		for ( fc=0; fc<8; fc++ ){ FmtKnown[fc] = 0; }		/* refresh formats ~1/sec */
 		Stats.capture_chan = CaptureChan;
 		Stats.src_rate     = (u32)SrcRate;
 		Stats.ring_level   = (u32)((int)(MixMax - MixDrain));

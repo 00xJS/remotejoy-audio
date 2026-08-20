@@ -1,5 +1,5 @@
 diff --git a/libretro/libretro.c b/libretro/libretro.c
-index f9566e9..e29d84a 100644
+index f9566e9..5db5469 100644
 --- a/libretro/libretro.c
 +++ b/libretro/libretro.c
 @@ -50,7 +50,7 @@ void retro_get_system_av_info(struct retro_system_av_info *info)
@@ -11,30 +11,83 @@ index f9566e9..e29d84a 100644
     };
  
     info->geometry = (struct retro_game_geometry) {
-@@ -100,6 +100,14 @@ void retro_reset(void)
+@@ -97,9 +97,65 @@ void retro_set_video_refresh(retro_video_refresh_t cb)
+ void retro_reset(void)
+ {}
+ 
++/* Dynamic rate control: the PSP produces 44100 frames/sec on its own clock,
++ * but RetroArch calls retro_run at the actual (often <60fps) video rate. A
++ * fixed 735-frame output drifts and the PSP-side buffer overflows -> chop.
++ * Instead, keep the client buffer near AUD_TARGET and let the batch size float,
++ * so average consumption equals production whatever the video rate is. */
++#define AUD_NOMINAL  735    /* 44100/60 */
++#define AUD_TARGET   2646   /* ~60ms cushion, absorbs frame-rate wobble */
++#define AUD_MAXBATCH 4096   /* cap */
++
  void retro_run(void)
  {
     run_program();
 +
-+   /* 44100 / 60 = 735 stereo frames per video frame; pad with silence on underrun */
-+   static int16_t abuf[735 * 2];
-+   size_t got = remotejoy_audio_pop(abuf, 735);
-+   if (got < 735)
-+      memset(abuf + got * 2, 0, (735 - got) * 2 * sizeof(int16_t));
-+   if (audio_batch_cb)
-+      audio_batch_cb(abuf, 735);
++   static int primed = 0;
++   static int16_t abuf[AUD_MAXBATCH * 2];
++   size_t level = remotejoy_audio_level();
++
++   /* fill the cushion before playing, so we don't start by underrunning */
++   if (!primed)
++   {
++      if (level < AUD_TARGET)
++      {
++         memset(abuf, 0, AUD_NOMINAL * 2 * sizeof(int16_t));
++         if (audio_batch_cb)
++            audio_batch_cb(abuf, AUD_NOMINAL);
++         return;
++      }
++      primed = 1;
++   }
++
++   /* Smooth the level first: audio arrives in ~1024-frame bursts, so the raw
++    * level sawtooths and a per-frame reaction makes the batch size jitter ->
++    * audible warble. A slow EMA tracks the true backlog; the batch size then
++    * changes gradually, holding a steady pitch. */
++   static double lvl_avg = -1.0;
++   if (lvl_avg < 0.0) lvl_avg = (double)level;
++   lvl_avg += ((double)level - lvl_avg) * 0.02;   /* ~0.8s time constant */
++
++   /* Divisor 8 (not 32) so the batch can reach ~2x nominal: at a dropped video
++    * rate (say 30fps) the client MUST consume ~1470 frames/call to keep up with
++    * the PSP's steady 44100/s, or its buffer overflows and drops -> chop. The
++    * EMA above keeps the change gradual, so a wide range does not warble. */
++   long want = AUD_NOMINAL + (long)((lvl_avg - AUD_TARGET) / 8.0);
++   if (want < 256)  want = 256;                 /* floor */
++   if (want > 2000) want = 2000;                /* ceiling: handles ~22fps */
++   if ((size_t)want > level) want = level;      /* never claim more than we have */
++   if (want > AUD_MAXBATCH) want = AUD_MAXBATCH;
++
++   size_t got = remotejoy_audio_pop(abuf, (size_t)want);
++   if ((size_t)want > got)
++      memset(abuf + got * 2, 0, ((size_t)want - got) * 2 * sizeof(int16_t));
++   if (audio_batch_cb && want > 0)
++      audio_batch_cb(abuf, (size_t)want);
++
++   if (level == 0)
++   {
++      primed  = 0;      /* ran dry: re-prime the cushion */
++      lvl_avg = -1.0;   /* and reset the smoother */
++   }
  }
  
  bool retro_load_game(const struct retro_game_info *info)
 diff --git a/libretro/remotejoy.c b/libretro/remotejoy.c
-index 430c05f..7246341 100644
+index 430c05f..b3b06c0 100644
 --- a/libretro/remotejoy.c
 +++ b/libretro/remotejoy.c
-@@ -1,14 +1,112 @@
+@@ -1,14 +1,125 @@
  #include <stdint.h>
  #include <string.h>
  #include <signal.h>
 +#include <unistd.h>
++#include <stdlib.h>
++#include <time.h>
  #include "remotejoy.h"
  #include "thread.h"
  #include "libusb/libusb/libusb.h"
@@ -63,6 +116,7 @@ index 430c05f..7246341 100644
 +   uint32_t bad_ptr;
 +   uint32_t cnt_disp;
 +   uint32_t clip;
++   uint32_t mono_mask;
 +   uint32_t n_slots;
 +   uint32_t dbg_cop0;
 +   uint32_t dbg_func;
@@ -120,6 +174,16 @@ index 430c05f..7246341 100644
 +   slock_unlock(g_alock);
 +}
 +
++size_t remotejoy_audio_level(void)
++{
++   size_t n;
++   if (!g_alock) return 0;
++   slock_lock(g_alock);
++   n = g_aring_used;
++   slock_unlock(g_alock);
++   return n;
++}
++
 +size_t remotejoy_audio_pop(int16_t *out, size_t frames)
 +{
 +   size_t got = 0;
@@ -143,11 +207,16 @@ index 430c05f..7246341 100644
  #define HOSTFS_MAGIC 0x782f0812
  #define ASYNC_MAGIC  0x782f0813
  #define BULK_MAGIC   0x782f0814
-@@ -184,6 +282,14 @@ static bool handle_hello(libusb_device_handle *dev)
+@@ -184,6 +295,19 @@ static bool handle_hello(libusb_device_handle *dev)
        return false;
     }
  
-+   if (!send_event(TYPE_AUDIO_CMD, le32(1), 0))
++   if (getenv("RJ_NOAUDIO"))
++   {
++      if (log_cb)
++         log_cb(RETRO_LOG_INFO, "RJ_NOAUDIO set - NOT requesting audio (framerate A/B).\n");
++   }
++   else if (!send_event(TYPE_AUDIO_CMD, le32(1), 0))
 +   {
 +      if (log_cb)
 +         log_cb(RETRO_LOG_WARN, "Audio enable request failed.\n");
@@ -158,7 +227,33 @@ index 430c05f..7246341 100644
     return true;
  }
  
-@@ -276,6 +382,42 @@ static void process_bulk(const uint8_t *block, size_t size)
+@@ -269,6 +393,25 @@ static void texture_argb8888(const void *block_, size_t size)
+    }
+ }
+ 
++static void fps_tick(int is_video)
++{
++   static long v = 0, a = 0;
++   static double t0 = -1.0;
++   struct timespec ts;
++   double now;
++   if (is_video) v++; else a++;
++   clock_gettime(CLOCK_MONOTONIC, &ts);
++   now = ts.tv_sec + ts.tv_nsec / 1e9;
++   if (t0 < 0.0) { t0 = now; return; }
++   if (now - t0 >= 2.0)
++   {
++      if (log_cb)
++         log_cb(RETRO_LOG_INFO, "[rate] video=%.1ffps audio=%.1f pkt/s\n",
++               v / (now - t0), a / (now - t0));
++      v = 0; a = 0; t0 = now;
++   }
++}
++
+ static void process_bulk(const uint8_t *block, size_t size)
+ {
+    struct JoyScrHeader *header = (struct JoyScrHeader*)block;
+@@ -276,6 +419,43 @@ static void process_bulk(const uint8_t *block, size_t size)
     //printf("VCount: %d\n", le32(header->ref));
     //printf("Size: %d\n", le32(header->size));
  
@@ -173,6 +268,7 @@ index 430c05f..7246341 100644
 +   uint32_t mode = le32(header->mode);
 +   if (mode == AUDIO_MODE_PCM)
 +   {
++      fps_tick(0);
 +      /* ref packs rate<<16 | seq; read unsigned so 44100 does not sign-extend */
 +      uint32_t ref = (uint32_t)le32(header->ref);
 +      audio_push(block + sizeof(*header), claimed, ref >> 16);
@@ -184,11 +280,11 @@ index 430c05f..7246341 100644
 +      g_audio_stats_seen++;
 +      if (log_cb && claimed >= sizeof(*st))
 +         log_cb(RETRO_LOG_INFO,
-+               "[audio] hooks=0x%03x chres=%u srcres=%u out=%u panned=%u src=%u drop=%u chans=0x%02x rate=%u ring=%u badptr=%u disp=%u clip=%u slots=%u\n",
++               "[audio] hooks=0x%03x chres=%u srcres=%u out=%u panned=%u src=%u drop=%u chans=0x%02x rate=%u ring=%u badptr=%u disp=%u clip=%u mono=0x%08x slots=%u\n",
 +               le32(st->hooks_ok), le32(st->cnt_chreserve), le32(st->cnt_srcreserve),
 +               le32(st->cnt_output), le32(st->cnt_panned), le32(st->cnt_src),
 +               le32(st->drop_bytes), le32(st->capture_chan), le32(st->src_rate),
-+               le32(st->ring_level), le32(st->bad_ptr), le32(st->cnt_disp), le32(st->clip), le32(st->n_slots));
++               le32(st->ring_level), le32(st->bad_ptr), le32(st->cnt_disp), le32(st->clip), le32(st->mono_mask), le32(st->n_slots));
 +      if (log_cb && claimed >= sizeof(*st))
 +         log_cb(RETRO_LOG_INFO,
 +               "[audio] TABLE cop0=0x%08x func=0x%08x | A: size=%d hits=%d | B: size=%d hits=%d\n",
@@ -201,7 +297,7 @@ index 430c05f..7246341 100644
     slock_lock(g_lock);
  
     //memcpy(g_frame, block + sizeof(*header), le32(header->size));
-@@ -283,19 +425,19 @@ static void process_bulk(const uint8_t *block, size_t size)
+@@ -283,19 +463,19 @@ static void process_bulk(const uint8_t *block, size_t size)
     switch ((header->mode >> 4) & 0x0f)
     {
        case 0x00:
@@ -225,7 +321,7 @@ index 430c05f..7246341 100644
           break;
        default:
           if (log_cb)
-@@ -318,6 +460,17 @@ static bool handle_bulk(libusb_device_handle *dev, uint8_t *data, size_t size)
+@@ -318,6 +498,29 @@ static bool handle_bulk(libusb_device_handle *dev, uint8_t *data, size_t size)
     size_t data_size = le32(cmd->size);
     //printf("Data size: %zu\n", data_size);
  
@@ -238,12 +334,24 @@ index 430c05f..7246341 100644
 +   }
 +
 +   if (data_size < sizeof(struct JoyScrHeader))
-+      return true; /* runt packet: nothing to dispatch, keep the old one intact */
++   {
++      /* runt: still drain the announced bytes off the pipe, or the next read
++         misreads them and both audio and video desync */
++      while (read_size < data_size)
++      {
++         int t = 0;
++         if (libusb_bulk_transfer(dev, 0x01 | LIBUSB_ENDPOINT_IN,
++                  bulk_block, data_size - read_size, &t, 3000) < 0 || t <= 0)
++            return false;
++         read_size += t;
++      }
++      return true;
++   }
 +
     while (read_size < data_size)
     {
        size_t to_read = data_size - read_size;
-@@ -331,6 +484,9 @@ static bool handle_bulk(libusb_device_handle *dev, uint8_t *data, size_t size)
+@@ -331,6 +534,9 @@ static bool handle_bulk(libusb_device_handle *dev, uint8_t *data, size_t size)
        if (ret < 0)
           return false;
  
@@ -253,7 +361,7 @@ index 430c05f..7246341 100644
        read_size += transferred;
     }
  
-@@ -367,13 +523,72 @@ error:
+@@ -367,13 +573,72 @@ error:
     return -1;
  }
  
@@ -285,7 +393,7 @@ index 430c05f..7246341 100644
 +      }
 +#endif
 +   }
-+
+ 
 +   if (libusb_set_configuration(g_dev, 1) < 0)
 +   {
 +      if (log_cb)
@@ -301,7 +409,7 @@ index 430c05f..7246341 100644
 +   }
 +
 +   return true;
- 
++
 +fail:
 +   libusb_close(g_dev);
 +   g_dev = NULL;
@@ -329,7 +437,7 @@ index 430c05f..7246341 100644
  
     bool active = false;
  
-@@ -383,7 +598,7 @@ static void bulk_thread(void *dummy)
+@@ -383,7 +648,7 @@ static void bulk_thread(void *dummy)
        if (active)
        {
           if (!send_event(TYPE_JOY_DAT, 0, 0))
@@ -338,7 +446,31 @@ index 430c05f..7246341 100644
        }
  
        int transferred = 0;
-@@ -415,7 +630,8 @@ static void bulk_thread(void *dummy)
+@@ -392,14 +657,19 @@ static void bulk_thread(void *dummy)
+ 
+       if (ret < 0)
+       {
+-         if (log_cb)
+-            log_cb(RETRO_LOG_ERROR, "Failed to do bulk with error: %d\n", ret);
+-
+          if (ret != LIBUSB_ERROR_TIMEOUT)
++         {
++            if (log_cb)
++               log_cb(RETRO_LOG_ERROR, "Failed to do bulk with error: %d\n", ret);
+             goto error;
++         }
++         /* a timeout that still moved bytes means a command header was torn
++            across the gap - the byte stream is now misaligned, so drop the
++            session and let the reconnect loop resynchronise */
++         if (transferred > 0)
++            return;
+       }
+ 
+-      //printf("Transferred: %d\n", transferred);
+       if (transferred < 4)
+          continue;
+ 
+@@ -415,7 +685,8 @@ static void bulk_thread(void *dummy)
              if (!handle_hello(g_dev))
                 goto error;
  
@@ -348,7 +480,7 @@ index 430c05f..7246341 100644
              break;
           case ASYNC_MAGIC:
              //printf("ASYNC_MAGIC\n");
-@@ -435,65 +651,81 @@ static void bulk_thread(void *dummy)
+@@ -435,65 +706,81 @@ static void bulk_thread(void *dummy)
  
     return;
  error:
@@ -467,7 +599,7 @@ index 430c05f..7246341 100644
     g_thread_failed = false;
     g_thread_die    = false;
     g_thread = sthread_create(bulk_thread, NULL);
-@@ -523,14 +755,14 @@ void deinit_program(void)
+@@ -523,14 +810,14 @@ void deinit_program(void)
        g_lock = NULL;
     }
  
@@ -487,7 +619,7 @@ index 430c05f..7246341 100644
     if (g_ctx)
     {
        libusb_exit(g_ctx);
-@@ -543,6 +775,24 @@ void run_program(void)
+@@ -543,6 +830,24 @@ void run_program(void)
     if (g_thread_failed)
        environ_cb(RETRO_ENVIRONMENT_SHUTDOWN, NULL);
  
@@ -513,14 +645,15 @@ index 430c05f..7246341 100644
     slock_lock(g_lock);
     memcpy(g_frame_buffer, g_frame, sizeof(g_frame));
 diff --git a/libretro/remotejoy.h b/libretro/remotejoy.h
-index f9f0a31..5e0aa42 100644
+index f9f0a31..90c8016 100644
 --- a/libretro/remotejoy.h
 +++ b/libretro/remotejoy.h
-@@ -19,4 +19,7 @@ bool init_program(void);
+@@ -19,4 +19,8 @@ bool init_program(void);
  void deinit_program(void);
  void run_program(void);
  
 +/* audio-over-usb: pop up to `frames` stereo s16 frames; returns frames written */
 +size_t remotejoy_audio_pop(int16_t *out, size_t frames);
++size_t remotejoy_audio_level(void);
 +
  #endif
